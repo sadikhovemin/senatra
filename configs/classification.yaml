@@ -1,0 +1,44 @@
+model:
+  img_size: 224
+  variant: "T"
+  lr: 0.00025
+  weight_decay: 0.05
+  warmup_epochs: 20
+  min_lr: 0.000001
+  num_classes: 1000
+
+data:
+  data_dir: /storage/group/dataset_mirrors/imagenet2012/imagenet2012_download
+  batch_size: 128
+  num_workers: 4
+  img_size: 224
+
+trainer:
+  accelerator: gpu
+  devices: 2
+  strategy: ddp_find_unused_parameters_true
+  max_epochs: 300
+  precision: 32
+  log_every_n_steps: 1000
+  gradient_clip_val: 1.0
+  benchmark: true
+
+  callbacks:
+    - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+      init_args:
+        monitor: val_acc
+        mode: max
+        save_top_k: 3
+        save_last: true
+        every_n_epochs: 10
+        filename: senatra-{epoch:02d}-{val_acc:.4f}
+
+  logger:
+    - class_path: lightning.pytorch.loggers.WandbLogger
+      init_args:
+        name: senatra-classification
+        project: senatra
+        entity: emin-sadikhov-technical-university-of-munich
+        save_dir: wandb_logs/
+        log_model: true
+        offline: false 
