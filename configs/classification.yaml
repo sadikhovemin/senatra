@@ -9,14 +9,13 @@ model:
 
 data:
   data_dir: /storage/group/dataset_mirrors/imagenet2012/imagenet2012_download
-  batch_size: 128
-  num_workers: 4
+  batch_size: 256
+  num_workers: 2
   img_size: 224
 
 trainer:
   accelerator: gpu
   devices: 2
-  strategy: ddp_find_unused_parameters_true
   max_epochs: 300
   precision: 32
   log_every_n_steps: 1000
