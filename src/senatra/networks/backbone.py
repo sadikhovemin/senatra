@@ -1,8 +1,8 @@
 import math
-import natten.functional as natten_F
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import natten.functional as natten_F
 from attn_gym.paged_attention.model import apply_rotary_emb, precompute_freqs_cis
 
 
@@ -17,16 +17,31 @@ def _get_rope(freq_cache, seq_len, dim, device, batch_size):
 
 
 # -----------------------------------------------------------------------------
-# 1. Self‑Attention blocks
+# Stochastic Drop
+# -----------------------------------------------------------------------------
+class DropPath(nn.Module):
+    def __init__(self, p=0.0):
+        super().__init__()
+        self.p = p
+
+    def forward(self, x):
+        if not self.training or self.p == 0.0:
+            return x
+        keep = torch.rand(x.shape[0], 1, 1, device=x.device) >= self.p
+        return x * keep / (1.0 - self.p)
+
+
+# -----------------------------------------------------------------------------
+# Self Attention Blocks
 # -----------------------------------------------------------------------------
 class LocalSelfAttention(nn.Module):
     """Neighborhood Attention (window=7) + RoPE positional encoding"""
 
-    def __init__(self, dim, num_heads=8, window=7):
+    def __init__(self, dim, head_dim=32, window=7):
         super().__init__()
-        assert dim % num_heads == 0
-        self.heads = num_heads
-        self.head_dim = dim // num_heads
+        assert dim % head_dim == 0
+        self.head_dim = head_dim
+        self.heads = dim // head_dim
         self.scale = self.head_dim**-0.5
         self.window = window
         self.qkv = nn.Linear(dim, dim * 3, bias=False)
@@ -70,8 +85,10 @@ class LocalSelfAttention(nn.Module):
 class GlobalSelfAttention(nn.Module):
     """Multi Head Attention with RoPE (used in final stage)"""
 
-    def __init__(self, dim, num_heads=8):
+    def __init__(self, dim, head_dim=32):
         super().__init__()
+        assert dim % head_dim == 0, "dim must be divisible by head_dim"
+        num_heads = dim // head_dim
         self.mha = nn.MultiheadAttention(dim, num_heads, batch_first=True, bias=False)
         self.freq_cache = {}
 
@@ -85,8 +102,48 @@ class GlobalSelfAttention(nn.Module):
         return out
 
 
+class SeNaTraBlock(nn.Module):
+    def __init__(
+        self,
+        H: int,
+        W: int,
+        dim: int,
+        mlp_ratio: float = 3.0,
+        local: bool = True,
+        drop_path=0.3,
+    ):
+        super().__init__()
+        self.H, self.W = H, W
+        self.ln1 = nn.LayerNorm(dim)
+        if local:
+            self.attn = LocalSelfAttention(dim, head_dim=32, window=7)
+        else:
+            self.attn = GlobalSelfAttention(dim=dim, head_dim=32)
+        self.ln2 = nn.LayerNorm(dim)
+        hidden = int(dim * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, hidden), nn.GELU(), nn.Linear(hidden, dim)
+        )
+        self.drop_path = DropPath(drop_path)
+
+    def forward(self, x):
+        # Layer norm, attention, and skip connection
+        x_norm = self.ln1(x)
+        x_attn = self.attn(x_norm, self.H, self.W)
+        x_drop = self.drop_path(x_attn)
+        x = x + x_drop
+
+        # Layer norm, MLP, and skip connection
+        x_norm = self.ln2(x)
+        x_mlp = self.mlp(x_norm)
+        x_drop = self.drop_path(x_mlp)
+        x = x + x_drop
+
+        return x
+
+
 # -----------------------------------------------------------------------------
-# 2. Grouping Layer
+# Grouping Layer
 # -----------------------------------------------------------------------------
 class _WindowRelPosBias(nn.Module):
     def __init__(self, heads: int):
@@ -98,207 +155,253 @@ class _WindowRelPosBias(nn.Module):
         return self.bias.view(1, -1, 1, 1, 9)
 
 
-def _build_q_and_in_idx(Ho: int, Wo: int):
-    """Return (q_idx→36, in_idx→N_in, col_idx→N_out)."""
-    rels = [(dy, dx) for dy in (-1, 0, 1) for dx in (-1, 0, 1)]
-    q_list, in_list, col_list = [], [], []
-    for h in range(4):
-        g_h, i_h, c_h = [], [], []
-        for oy in range(Ho):
-            for ox in range(Wo):
-                base = (oy * Wo + ox) * 9
-                g_tmp, i_tmp, c_tmp = [], [], []
-                for dy, dx in rels:
-                    ny, nx = oy + dy, ox + dx
-                    if 0 <= ny < Ho and 0 <= nx < Wo:
-                        coarse = ny * Wo + nx
-                        g_tmp.append(base + (dy + 1) * 3 + (dx + 1))
-                        i_tmp.append(coarse * 4 + h)
-                        c_tmp.append(coarse)
-                    else:
-                        g_tmp.append(0)
-                        i_tmp.append(0)
-                        c_tmp.append(0)
-                g_h.append(torch.tensor(g_tmp * 4))  # → 36
-                i_h.append(torch.tensor(i_tmp * 4))
-                c_h.append(torch.tensor(c_tmp * 4))
-        q_list.append(torch.stack(g_h))
-        in_list.append(torch.stack(i_h))
-        col_list.append(torch.stack(c_h))
-    return (
-        torch.stack(q_list).long(),  # (4,N_out,36)
-        torch.stack(in_list).long(),  # (4,N_out,36) indices into N_in
-        torch.stack(col_list).long(),  # (4,N_out,36) indices into N_out
-    )
+def compute_q_idx(Hi, Wi, kernel_size=3, B=1, G=1):
+
+    with torch.no_grad():
+        dummy_q = torch.arange(Hi * Wi, dtype=torch.float32).reshape(1, 1, Hi, Wi, 1)
+        dummy_k = torch.ones_like(dummy_q)
+
+        q_idx = natten_F.na2d_qk(query=dummy_k, key=dummy_q, kernel_size=kernel_size)
+
+    return q_idx
 
 
 class SparseGroupingLayer(nn.Module):
     def __init__(
         self,
-        h_in: int,
-        w_in: int,
+        in_h: int,
+        in_w: int,
         dim: int,
         window=3,
-        loc: bool = True,
+        local: bool = True,
         num_iters: int = 3,
     ):
         super().__init__()
-        self.Hi, self.Wi = h_in, w_in
-        self.Ho, self.Wo = h_in // 2, w_in // 2
-        self.N_in, self.N_out = h_in * w_in, (h_in // 2) * (w_in // 2)
-        self.dim, self.loc, self.num_iters = dim, loc, num_iters
-        self.window = window
+        self.Hi, self.Wi = (
+            in_h,
+            in_w,
+        )  # Dimensions of the input tokens - X_in in algorithm 1 in the paper
+        self.Ho, self.Wo = (
+            in_h // 2,
+            in_w // 2,
+        )  # Dimensions of the output tokens - X_out in algorithm 1 in the paper
+        self.N_in, self.N_out = in_h * in_w, (in_h // 2) * (
+            in_w // 2
+        )  # Number of input and output tokens
+        self.dim = dim  # Dimension of the input tokens
+        self.local = local  # Whether to use local self attention
+        self.num_iters = num_iters  # Number of iterations in the sparse grouping layer
+        self.window = window  # Window size for the local self attention
 
-        self.seed_conv = nn.Conv2d(dim, dim, 3, 2, 1, bias=False)
-        nn.init.kaiming_normal_(self.seed_conv.weight, nonlinearity="relu")
-        self.q_proj = nn.Linear(dim, dim, bias=False)
-        self.k_proj = nn.Linear(dim, dim, bias=False)
-        self.v_proj = nn.Linear(dim, dim, bias=False)
+        # Initial convolution layer for downsampling and create the initial slots - line 1 in algorithm 1 in the paper
+        self.seed_conv = nn.Conv2d(
+            in_channels=dim,
+            out_channels=dim,
+            kernel_size=3,
+            stride=2,
+            padding=1,
+            bias=False,
+        )
+        nn.init.kaiming_normal_(
+            self.seed_conv.weight, nonlinearity="relu"
+        )  # Initialize the weights of the convolution layer
+
+        # Project X_in and X_out into query = q_proj(X_out), key = k_proj(X_in), and value = v_proj(X_in) vectors.
+        self.q_proj = nn.Linear(in_features=dim, out_features=dim, bias=False)
+        self.k_proj = nn.Linear(in_features=dim, out_features=dim, bias=False)
+        self.v_proj = nn.Linear(in_features=dim, out_features=dim, bias=False)
+
+        # MLP layer for updating the slots - line 10 in algorithm 1 in the paper
         self.mlp = nn.Sequential(
             nn.Linear(dim, dim * 2), nn.GELU(), nn.Linear(dim * 2, dim)
         )
+
         self.ln_in, self.ln_out = nn.LayerNorm(dim), nn.LayerNorm(dim)
         self.tau = nn.Parameter(torch.tensor(math.log(dim**-0.5)))
 
-        if loc:
+        if local:
             self.rpb = _WindowRelPosBias(4)
-            q_idx, in_idx, col_idx = _build_q_and_in_idx(self.Ho, self.Wo)
+            q_idx = compute_q_idx(self.Ho, self.Wo, kernel_size=self.window)
             self.register_buffer("q_idx", q_idx, persistent=False)
-            self.register_buffer("in_idx", in_idx, persistent=False)
-            self.register_buffer("col_idx", col_idx, persistent=False)
 
     # ----- dense -------------------------------------------------------
     def _dense_forward(self, x):
-        B, _, D = x.shape
+        B, N_in, D = x.shape
         eps = 1e-6
         x_out = self.ln_out(
             self.seed_conv(x.transpose(1, 2).reshape(B, D, self.Hi, self.Wi))
             .flatten(2)
             .transpose(1, 2)
         )
-        k = self.k_proj(self.ln_in(x))
-        v = self.v_proj(x)
+        k = self.k_proj(self.ln_in(x))  # Shape: (B, N_in, D)
+        v = self.v_proj(x)  # Shape: (B, N_in, D)
+
         for _ in range(self.num_iters):
-            q = self.q_proj(self.ln_out(x_out))
-            logits = torch.bmm(q, k.transpose(1, 2)) * torch.exp(self.tau)
-            a_row = logits.softmax(dim=-1) + eps
-            denom = a_row.sum(dim=1, keepdim=True)
-            a_col = a_row / denom
-            x_out = x_out + torch.bmm(a_col, v)
+            q = self.q_proj(self.ln_out(x_out))  # Shape: (B, N_out, D)
+            logits = torch.bmm(k, q.transpose(1, 2)) * torch.exp(self.tau)
+            a_ups = logits.softmax(dim=-1) + eps
+            col_sums = a_ups.sum(dim=1, keepdim=True)  # Shape: (B, 1, N_out)
+            a_down = a_ups / col_sums  # Shape: (B, N_in, N_out)
+
+            updates = torch.bmm(a_down.transpose(1, 2), v)
+            x_out = x_out + self.ln_out(updates)
+
             x_out = x_out + self.ln_out(self.mlp(x_out))
-        return x_out, a_row.transpose(1, 2), a_col
+
+        return x_out, a_ups, a_down
 
     # ----- sparse ------------------------------------------------------
     def _sparse_forward(self, x):
         B, _, D = x.shape
         eps = 1e-6
+
+        A_row_list, A_col_list = [], []
+
         # ---- K, V patches ------------------------------------------------
-        k_map = (
-            self.k_proj(self.ln_in(x)).transpose(1, 2).reshape(B, D, self.Hi, self.Wi)
-        )
-        v_map = self.v_proj(x).transpose(1, 2).reshape(B, D, self.Hi, self.Wi)
-        k = (
-            F.unfold(k_map, 2, stride=2)
-            .view(B, D, 4, self.Ho, self.Wo)
-            .permute(0, 2, 3, 4, 1)
-            .contiguous()
-        )
-        v = (
-            F.unfold(v_map, 2, stride=2)
-            .view(B, D, 4, self.Ho, self.Wo)
-            .permute(0, 2, 3, 4, 1)
-            .contiguous()
-        )
+        # Project and reshape k
+        k_proj = self.k_proj(self.ln_in(x))  # (B, N, self.dim)
+        k_trans = k_proj.transpose(1, 2)  # (B, self.dim, N)
+        k_map = k_trans.reshape(
+            B, D, self.Hi, self.Wi
+        )  # (B, self.dim, self.Hi, self.Wi)
+        k_unfold = F.unfold(
+            input=k_map, kernel_size=2, stride=2
+        )  # (B, self.dim*4, self.Ho*self.Wo) where Ho = Hi/2 and Wo = Wi/2
+        k_view = k_unfold.view(
+            B, D, 4, self.Ho, self.Wo
+        )  # (B, self.dim, 4, self.Ho, self.Wo)
+        k = k_view.permute(
+            0, 2, 3, 4, 1
+        ).contiguous()  # (B, 4, self.Ho, self.Wo, self.dim)
+
+        # Project and reshape v
+        v_proj = self.v_proj(x)  # (B, N, self.dim)
+        v_trans = v_proj.transpose(1, 2)  # (B, self.dim, N)
+        v_map = v_trans.reshape(
+            B, D, self.Hi, self.Wi
+        )  # (B, self.dim, self.Hi, self.Wi)
+        v_unfold = F.unfold(
+            input=v_map, kernel_size=2, stride=2
+        )  # (B, self.dim*4, self.Ho*self.Wo) where Ho = Hi/2 and Wo = Wi/2
+        v_view = v_unfold.view(
+            B, D, 4, self.Ho, self.Wo
+        )  # (B, self.dim, 4, self.Ho, self.Wo)
+        v = v_view.permute(
+            0, 2, 3, 4, 1
+        ).contiguous()  # (B, 4, self.Ho, self.Wo, self.dim)
 
         # ---- seed slots ---------------------------------------------------
-        x_out = self.ln_out(
-            self.seed_conv(x.transpose(1, 2).reshape(B, D, self.Hi, self.Wi))
-            .flatten(2)
-            .transpose(1, 2)
-        )
+        x_reshaped = x.transpose(1, 2).reshape(
+            B, D, self.Hi, self.Wi
+        )  # (B, D, self.Hi, self.Wi)
+        x_conv = self.seed_conv(x_reshaped)  # (B, D, self.Ho, self.Wo)
+        x_flat = x_conv.flatten(2)  # (B, D, self.Ho*self.Wo)
+        x_trans = x_flat.transpose(1, 2)  # (B, self.Ho*self.Wo, D)
+        x_out = self.ln_out(x_trans)  # (B, self.Ho*self.Wo, D)
 
         for _ in range(self.num_iters):
-            q = (
-                self.q_proj(self.ln_out(x_out))
-                .view(B, self.Ho, self.Wo, D)
-                .unsqueeze(1)
-                .repeat(1, 4, 1, 1, 1)
-            ).contiguous()  # (B,4,Ho,Wo,D)
-            attn = natten_F.na2d_qk(q, k, 3) + self.rpb()
-            attn = F.softmax(attn * torch.exp(self.tau), dim=-1) + eps  # (B,4,Ho,Wo,9)
+            q = self.q_proj(self.ln_out(x_out))  # (B, self.Ho*self.Wo, D)
+            q = q.view(B, self.Ho, self.Wo, D)  # (B, self.Ho, self.Wo, D)
+            q = q.unsqueeze(1)  # (B, 1, self.Ho, self.Wo, D)
+            q = q.repeat(1, 4, 1, 1, 1)  # (B, 4, self.Ho, self.Wo, D)
+            q = q.contiguous()  # (B, 4, self.Ho, self.Wo, D)
 
-            # ---- expand to 36 coeffs ------------------------------------
-            flat = attn.reshape(B, 4, -1)  # (B,4,N_out*9)
-            attn36 = flat.gather(-1, self.q_idx.view(1, 4, -1).expand(B, -1, -1)).view(
-                B, 4, self.N_out, 36
+            # ---- attention -----------------------------------------------
+            attn = natten_F.na2d_qk(
+                query=k, key=q, kernel_size=3
+            )  # (B, 4, self.Ho, self.Wo, 9) - the last dimension is the size of the local region that query attends to in the key
+            attn = attn + self.rpb()  # (B, 4, self.Ho, self.Wo, 9)
+            attn = (
+                F.softmax(attn * torch.exp(self.tau), dim=-1) + eps
+            )  # (B, 4, self.Ho, self.Wo, 9) - Each token in X_in (self.Hi*self.Wi) attends to 9 tokens in X_out (self.Ho*self.Wo) where Ho = Hi/2 and Wo = Wi/2
+
+            # Flatten attn over spatial dimensions (Ho*Wo)
+            attn_flat = attn.flatten(2, 3)  # (B, 4, Ho*Wo, 9)
+            q_idx_flat = (
+                self.q_idx.expand(B, 4, -1, -1, -1).flatten(2, 3).long()
+            )  # (B, 1, Ho*Wo, 9)
+
+            num_input_tokens = 4 * self.Ho * self.Wo
+
+            # We create a tensor to hold the sum of each column (input token)
+            col_sums_sparse = torch.zeros(
+                B, num_input_tokens, dtype=torch.float32, device=q.device
             )
-            denom = attn36.sum(dim=(1, 3), keepdim=True)
-            a_col_h = attn36 / (denom + eps)
 
-            # ---- build dense A_col --------------------------------------
-            A_col = torch.zeros(B, self.N_in, self.N_out, device=x.device)
-            idx_in = self.in_idx.view(1, 4, self.N_out, 36).expand(B, -1, -1, -1)
-            A_col.scatter_add_(1, idx_in.reshape(B, -1, 36), a_col_h.reshape(B, -1, 36))
+            # Flatten the attention scores and indices for efficient processing
+            attn_flat_1d = attn_flat.flatten(1, -1)  # (B, 4*784*9) = (256, 28224)
+            q_idx_flat_1d = q_idx_flat.flatten(1, -1)  # (B, 4*784*9) = (256, 28224)
 
-            # ---- updates -------------------------------------------------
-            attn9 = a_col_h[..., :9].contiguous().view(B, 4, self.Ho, self.Wo, 9)
-            updates = natten_F.na2d_av(attn9, v, 3)
+            # Create batch offsets to make indices unique across batches
+            batch_offsets = (
+                torch.arange(B, device=q.device).unsqueeze(1) * num_input_tokens
+            )
+            q_idx_with_batch = q_idx_flat_1d + batch_offsets
+
+            # Flatten everything for a single scatter_add_ operation
+            # This sums all attention scores that belong to the same input token (column)
+            col_sums_flat = col_sums_sparse.flatten()  # (B * 3136) = (1024)
+            q_idx_flat_all = q_idx_with_batch.flatten()  # (B * 576) = (9216)
+            attn_flat_all = attn_flat_1d.flatten()  # (B * 576) = (9216)
+
+            # Single scatter_add_ operation for all batches
+            # This sums all attention scores that belong to the same input token (column)
+            col_sums_flat.scatter_add_(
+                dim=0, index=q_idx_flat_all.to(torch.int64), src=attn_flat_all
+            )
+
+            # Reshape back to (B, num_input_tokens)
+            col_sums_sparse = col_sums_flat.view(B, num_input_tokens)
+
+            # 2. Gather the corresponding column sum for each attention score
+            # We need to reshape col_sums_sparse to match the dimensions of q_idx_flat
+            # col_sums_sparse: (B, num_input_tokens) -> (B, 1, num_input_tokens) -> (B, 4, Ho*Wo, num_input_tokens)
+            col_sums_expanded = (
+                col_sums_sparse.unsqueeze(1)
+                .unsqueeze(2)
+                .expand(B, 4, self.Ho * self.Wo, -1)
+            )
+
+            # Gather the appropriate column sum for each attention score
+            # q_idx_flat: (B, 1, Ho*Wo, 9) contains indices into the num_input_tokens
+            col_sums_for_each_attn = torch.gather(
+                col_sums_expanded, dim=3, index=q_idx_flat.to(torch.int64)
+            )
+
+            # 3. Perform column normalization
+            A_col = attn_flat / (col_sums_for_each_attn + 1e-8)  # (B, 4, 784, 9)
+            A_col = A_col.view(B, 4, self.Ho, self.Wo, 9)
+
+            updates = natten_F.na2d_av(A_col, v, 3)
             updates = updates.sum(dim=1).permute(0, 3, 1, 2).flatten(2).transpose(1, 2)
             x_out = x_out + updates
             x_out = x_out + self.ln_out(self.mlp(x_out))
 
-        # ---- A_row via col_idx -------------------------------------------
-        A_row = torch.zeros_like(A_col)
-        idx_out = self.col_idx.view(1, 4, self.N_out, 36).expand(B, -1, -1, -1)
-        flat_r = attn36.view(B, 4 * self.N_out, 36)
-        A_row.scatter_add_(2, idx_out.reshape(B, -1, 36), flat_r)
-        return x_out, A_row, A_col
+            A_row_list.append(attn)
+            A_col_list.append(A_col)
+
+        return x_out, A_row_list[-1], A_col_list[-1]
 
     def forward(self, x: torch.Tensor):
-        return self._sparse_forward(x) if self.loc else self._dense_forward(x)
-
-
-# -----------------------------------------------------------------------------
-# 3. SeNaTra Backbone
-# -----------------------------------------------------------------------------
-class SeNaTraBlock(nn.Module):
-    def __init__(
-        self, H: int, W: int, dim: int, mlp_ratio: float = 3.0, local: bool = True
-    ):
-        super().__init__()
-        self.H, self.W = H, W
-        self.ln1 = nn.LayerNorm(dim)
-        if local:
-            self.attn = LocalSelfAttention(dim, num_heads=8, window=7)
-        else:
-            self.attn = GlobalSelfAttention(dim, num_heads=8)
-        self.ln2 = nn.LayerNorm(dim)
-        hidden = int(dim * mlp_ratio)
-        self.mlp = nn.Sequential(
-            nn.Linear(dim, hidden), nn.GELU(), nn.Linear(hidden, dim)
-        )
-
-    def forward(self, x):
-        x = x + self.attn(self.ln1(x), self.H, self.W)
-        x = x + self.mlp(self.ln2(x))
-        return x
-
-
-class PatchEmbed(nn.Module):
-    """4x4 patch embed"""
-
-    def __init__(self, img_size=224, patch_size=4, in_channels=3, embed_dim=96):
-        super().__init__()
-        self.proj = nn.Conv2d(in_channels, embed_dim, patch_size, patch_size)
-        self.norm = nn.LayerNorm(embed_dim)
-        self.H = self.W = img_size // patch_size
-
-    def forward(self, x):
-        x = self.proj(x).flatten(2).transpose(1, 2)
-        return self.norm(x)
+        # x: (B, N, D)
+        return self._sparse_forward(x) if self.local else self._dense_forward(x)
 
 
 class SeNaTraStage(nn.Module):
+    """
+    SeNaTraStage is a stage of the SeNaTra backbone shown in Figure 1a of the paper.
+    Its main building blocks are:
+    - Sparse Grouping Layer:
+        - use_group is False on the first stage, and True on the other stages.
+        - Grouping layer is applied locally in the second and third stages.
+        - Dense grouping is applied in the fourth stage.
+    - SeNaTra Blocks:
+        - This block consists of a self-attention layer, layer normalization, and an MLP layer.
+        - The self-attention layer is applied locally in the first three stages.
+        - Global self-attention is applied in the fourth stage.
+        - The output of the stage is the output of the last SeNaTra block.
+    """
+
     def __init__(
         self,
         in_h: int,
@@ -315,14 +418,16 @@ class SeNaTraStage(nn.Module):
         self.use_group = use_group
         if use_group:
             self.group = SparseGroupingLayer(
-                in_h,
-                in_w,
-                dim_in,
-                loc=not dense_group,
+                in_h=in_h,
+                in_w=in_w,
+                dim=dim_in,
                 window=3 if not dense_group else None,
+                local=not dense_group,
                 num_iters=3,
             )
-            self.proj = nn.Linear(dim_in, dim_out)
+            self.proj = nn.Linear(
+                dim_in, dim_out
+            )  # Should we do the projection here or inside the sparse grouping layer?
             self.norm = nn.LayerNorm(dim_out)
             post_h, post_w = in_h // 2, in_w // 2
             post_dim = dim_out
@@ -336,11 +441,49 @@ class SeNaTraStage(nn.Module):
         )
 
     def forward(self, x):
+        # x: (B, 3136, 64 (T), 128 (B), 192 (L))
         if self.use_group:
-            x, *_ = self.group(x)
-            x = self.norm(self.proj(x))
+            x, A_up, A_down = self.group(x)
+            x = self.proj(x)
+            x = self.norm(x)
+        else:
+            A_up = None
+            A_down = None
+
         for blk in self.blocks:
             x = blk(x)
+
+        return x, A_up, A_down
+
+
+class PatchEmbed(nn.Module):
+    """
+    Split each image into non-overlapping patch_size x patch_size patches and linealy projects them to dimension embed_dim
+    Input: x of shape (B, 3, H, W)
+    Output: patches of shape (B, N, C) where N = (H/patch_size) * (W/patch_size)
+    """
+
+    def __init__(self, img_size=224, patch_size=4, in_channels=3, embed_dim=96):
+        super().__init__()
+        self.proj = nn.Conv2d(
+            in_channels=in_channels,
+            out_channels=embed_dim,
+            kernel_size=patch_size,
+            stride=patch_size,
+        )
+
+        self.norm = nn.LayerNorm(embed_dim)
+        self.H = self.W = img_size // patch_size
+
+    def forward(self, x):
+        # x: (B, 3, 224, 224)
+
+        x = self.proj(x)  # (B, 96, 56, 56)
+        x = x.flatten(2)  # (B, 96, 3136)
+        x = x.transpose(1, 2)  # (B, 3136, 96)
+
+        x = self.norm(x)  # (B, 3136, 96)
+
         return x
 
 
@@ -353,46 +496,103 @@ class SeNaTra(nn.Module):
         "L": dict(depths=[3, 4, 18, 5], dims=[192, 384, 768, 1536], mlp=2.0),
     }
 
-    def __init__(self, img_size=224, variant="T", in_chans=3, embed_dim=96):
+    def __init__(self, img_size=224, variant="T", in_channels=3, embed_dim=96):
         super().__init__()
+
         cfg = self.cfgs[variant]
-        self.patch = PatchEmbed(img_size, 4, in_chans, embed_dim)
-        self.proj0 = nn.Linear(embed_dim, cfg["dims"][0])
+        self.patch = PatchEmbed(
+            img_size=img_size,
+            patch_size=4,
+            in_channels=in_channels,
+            embed_dim=embed_dim,
+        )
+
+        self.proj0 = nn.Linear(in_features=embed_dim, out_features=cfg["dims"][0])
+
         self.norm0 = nn.LayerNorm(cfg["dims"][0])
 
-        H = W = img_size // 4
-        dim = cfg["dims"][0]
+        H = W = (
+            img_size // 4
+        )  # image size after patch embedding layer: img_size / patch_size
 
-        # Stage 0 (no downsample, local)
+        # Stage 0
+        # No grouping, no downsample,
+        # Only applies local self attension in SeNaTra blocks
         self.s0 = SeNaTraStage(
-            H, W, dim, dim, cfg["depths"][0], cfg["mlp"], False, False, True
+            in_h=H,
+            in_w=W,
+            dim_in=cfg["dims"][0],
+            dim_out=cfg["dims"][0],
+            depth=cfg["depths"][0],
+            mlp_ratio=cfg["mlp"],
+            use_group=False,
+            dense_group=False,
+            local_blocks=True,
         )
 
-        # Stage 1 (local grouping)
+        # Stage 1
+        # Local grouping, local self attention in SeNaTra blocks
         self.s1 = SeNaTraStage(
-            H, W, dim, cfg["dims"][1], cfg["depths"][1], cfg["mlp"], True, False, True
+            in_h=H,
+            in_w=W,
+            dim_in=cfg["dims"][0],
+            dim_out=cfg["dims"][1],
+            depth=cfg["depths"][1],
+            mlp_ratio=cfg["mlp"],
+            use_group=True,
+            dense_group=False,
+            local_blocks=True,
         )
+        # Dimensions are halved after the grouping layer
         H //= 2
         W //= 2
-        dim = cfg["dims"][1]
 
-        # Stage 2 (local grouping)
+        # Stage 2
+        # Local grouping, local self attention in SeNaTra blocks
         self.s2 = SeNaTraStage(
-            H, W, dim, cfg["dims"][2], cfg["depths"][2], cfg["mlp"], True, False, True
+            in_h=H,
+            in_w=W,
+            dim_in=cfg["dims"][1],
+            dim_out=cfg["dims"][2],
+            depth=cfg["depths"][2],
+            mlp_ratio=cfg["mlp"],
+            use_group=True,
+            dense_group=False,
+            local_blocks=True,
         )
+        # Dimensions are halved after the grouping layer
         H //= 2
         W //= 2
-        dim = cfg["dims"][2]
 
-        # Stage 3 (dense grouping, global attn)
+        # Stage 3
+        # Dense grouping, global self attention in SeNaTra blocks
         self.s3 = SeNaTraStage(
-            H, W, dim, cfg["dims"][3], cfg["depths"][3], cfg["mlp"], True, True, False
+            in_h=H,
+            in_w=W,
+            dim_in=cfg["dims"][2],
+            dim_out=cfg["dims"][3],
+            depth=cfg["depths"][3],
+            mlp_ratio=cfg["mlp"],
+            use_group=True,
+            dense_group=True,
+            local_blocks=False,
         )
 
-    def forward(self, x):
-        x = self.norm0(self.proj0(self.patch(x)))
-        x = self.s0(x)
-        x = self.s1(x)
-        x = self.s2(x)
-        x = self.s3(x)
-        return x  # final tokens 7×7
+    def forward(self, x, return_attn=False):
+        # Patch Embedding
+        # x: (B, 3, 224, 224)
+        x = self.patch(x)  # (B, 3136, 96)
+        x = self.proj0(x)  # (B, 3136, 64 (T), 128 (B), 192 (L))
+        x = self.norm0(x)  # (B, 3136, 64 (T), 128 (B), 192 (L))
+
+        maps = []
+
+        # Stage-0  (no grouping)
+        x, *_ = self.s0(x)
+
+        # Stage-1 … 3  (with grouping)
+        for name, stage in (("s1", self.s1), ("s2", self.s2), ("s3", self.s3)):
+            x, A_up, A_down = stage(x)
+            maps.append((name, A_up, A_down))
+
+        return (x, maps) if return_attn else x

@@ -1,8 +1,8 @@
 import os
+import lightning.pytorch as pl
 from torchvision import transforms
 from torchvision.datasets import ImageFolder
 from torch.utils.data import DataLoader
-import lightning.pytorch as pl
 
 
 def build_train_transforms(img_size):
@@ -10,9 +10,13 @@ def build_train_transforms(img_size):
         [
             transforms.RandomResizedCrop(img_size),
             transforms.RandomHorizontalFlip(),
+            transforms.RandAugment(),
             transforms.ColorJitter(0.4, 0.4, 0.4, 0.1),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+            transforms.RandomErasing(
+                p=0.25, scale=(0.02, 0.33), ratio=(0.3, 3.3), value="random"
+            ),
         ]
     )
 
@@ -46,12 +50,15 @@ class ImageNetDataModule(pl.LightningDataModule):
             transform=build_val_transforms(self.img_size),
         )
 
+
     def train_dataloader(self):
         return DataLoader(
             self.train_dataset,
             batch_size=self.batch_size,
             shuffle=True,
             num_workers=self.num_workers,
+            drop_last=True,
+            pin_memory=True,
         )
 
     def val_dataloader(self):
@@ -60,4 +67,5 @@ class ImageNetDataModule(pl.LightningDataModule):
             batch_size=self.batch_size,
             shuffle=False,
             num_workers=self.num_workers,
+            pin_memory=True,
         )
