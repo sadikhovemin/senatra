@@ -88,18 +88,29 @@ class GlobalSelfAttention(nn.Module):
     def __init__(self, dim, head_dim=32):
         super().__init__()
         assert dim % head_dim == 0, "dim must be divisible by head_dim"
-        num_heads = dim // head_dim
-        self.mha = nn.MultiheadAttention(dim, num_heads, batch_first=True, bias=False)
+        self.head_dim = head_dim
+        self.num_heads = dim // head_dim
+        self.qkv = nn.Linear(dim, dim * 3, bias=False)
+        self.proj = nn.Linear(dim, dim)
         self.freq_cache = {}
 
     def forward(self, x, *_):
         B, N, C = x.shape
-        freqs = _get_rope(self.freq_cache, N, C // self.mha.num_heads, x.device, B)
-        qk = apply_rotary_emb(
-            x.view(B, N, self.mha.num_heads, C // self.mha.num_heads), freqs
-        ).view(B, N, C)
-        out, _ = self.mha(qk, qk, x, need_weights=False)
-        return out
+
+        # 1. Project to Q, K, V
+        qkv = (
+            self.qkv(x)
+            .view(B, N, 3, self.num_heads, self.head_dim)
+            .permute(2, 0, 3, 1, 4)
+        )
+        q, k, v = qkv[0], qkv[1], qkv[2]  # Shape: [B, num_heads, N, head_dim]
+        freqs = _get_rope(self.freq_cache, N, self.head_dim, x.device, B)
+        q = apply_rotary_emb(q.permute(0, 2, 1, 3), freqs).permute(0, 2, 1, 3)
+        k = apply_rotary_emb(k.permute(0, 2, 1, 3), freqs).permute(0, 2, 1, 3)
+
+        out = F.scaled_dot_product_attention(q, k, v)
+        out = out.transpose(1, 2).reshape(B, N, C)
+        return self.proj(out)
 
 
 class SeNaTraBlock(nn.Module):
@@ -496,7 +507,7 @@ class SeNaTra(nn.Module):
         "L": dict(depths=[3, 4, 18, 5], dims=[192, 384, 768, 1536], mlp=2.0),
     }
 
-    def __init__(self, img_size=224, variant="T", in_channels=3, embed_dim=96):
+    def __init__(self, img_size=224, variant="T", in_channels=3, embed_dim=64):
         super().__init__()
 
         cfg = self.cfgs[variant]
@@ -504,12 +515,8 @@ class SeNaTra(nn.Module):
             img_size=img_size,
             patch_size=4,
             in_channels=in_channels,
-            embed_dim=embed_dim,
+            embed_dim=cfg["dims"][0],
         )
-
-        self.proj0 = nn.Linear(in_features=embed_dim, out_features=cfg["dims"][0])
-
-        self.norm0 = nn.LayerNorm(cfg["dims"][0])
 
         H = W = (
             img_size // 4
@@ -581,9 +588,7 @@ class SeNaTra(nn.Module):
     def forward(self, x, return_attn=False):
         # Patch Embedding
         # x: (B, 3, 224, 224)
-        x = self.patch(x)  # (B, 3136, 96)
-        x = self.proj0(x)  # (B, 3136, 64 (T), 128 (B), 192 (L))
-        x = self.norm0(x)  # (B, 3136, 64 (T), 128 (B), 192 (L))
+        x = self.patch(x)  # (B, 3136, 64 (T), 128 (B), 192 (L))
 
         maps = []
 

@@ -41,8 +41,17 @@ class SeNaTraClassificationModule(pl.LightningModule):
         logits = self(x)
         loss = self.criterion(logits, y)
         acc = (logits.argmax(dim=1) == y).float().mean()
-        self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True)
-        self.log("train_acc", acc, on_step=True, on_epoch=True, prog_bar=True)
+        self.log(
+            "train_loss",
+            loss,
+            on_step=True,
+            on_epoch=True,
+            sync_dist=True,
+            prog_bar=True,
+        )
+        self.log(
+            "train_acc", acc, on_step=True, on_epoch=True, sync_dist=True, prog_bar=True
+        )
 
         lr = self.trainer.optimizers[0].param_groups[0]["lr"]
         self.log("learning_rate", lr, on_step=True, on_epoch=False, prog_bar=True)
@@ -53,8 +62,12 @@ class SeNaTraClassificationModule(pl.LightningModule):
         logits = self(x)
         loss = self.criterion(logits, y)
         acc = (logits.argmax(dim=1) == y).float().mean()
-        self.log("val_loss", loss, on_step=True, on_epoch=True, prog_bar=True)
-        self.log("val_acc", acc, on_step=True, on_epoch=True, prog_bar=True)
+        self.log(
+            "val_loss", loss, on_step=True, on_epoch=True, sync_dist=True, prog_bar=True
+        )
+        self.log(
+            "val_acc", acc, on_step=True, on_epoch=True, sync_dist=True, prog_bar=True
+        )
         return {"val_loss": loss, "val_acc": acc}
 
     def configure_optimizers(self):

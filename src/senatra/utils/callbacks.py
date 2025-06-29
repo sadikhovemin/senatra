@@ -22,9 +22,15 @@ def up_grid_to_matrix(A_up_grid, q_idx):
 
 
 class AttnMapLogger(L.Callback):
-    def __init__(self, log_every_n_batches=50, max_imgs=4):
+    def __init__(
+        self, train_log_every_n_epochs=5, val_log_every_n_epochs=10, max_imgs=4
+    ):
         super().__init__()
-        self.freq, self.max_imgs = log_every_n_batches, max_imgs
+        self.train_epoch_freq = train_log_every_n_epochs
+        self.val_epoch_freq = val_log_every_n_epochs
+        self.max_imgs = max_imgs
+
+        # self.freq, self.max_imgs = log_every_n_batches, max_imgs
         self.palette = torch.rand(1, 1024, 3)  # fixed colour set
 
     def _colourise(self, idx_map):
@@ -33,9 +39,8 @@ class AttnMapLogger(L.Callback):
         color = pal.squeeze(0)[flat]  # (H·W,3)
         return color.view(*idx_map.shape, 3).permute(2, 0, 1)  # [3,H,W]
 
-    @torch.no_grad()
-    def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
-        if batch_idx % self.freq:
+    def _log_attn_maps(self, trainer, pl_module, batch, batch_idx, phase="val"):
+        if trainer.global_rank != 0:
             return
 
         imgs, _ = batch
@@ -86,6 +91,23 @@ class AttnMapLogger(L.Callback):
             torch.cat(viz_stack, 0), nrow=4, normalize=True, scale_each=True
         )
         trainer.logger.experiment.log(
-            {"val/segmentation_hierarchy": wandb.Image(grid)},
-            step=trainer.global_step,
+            {
+                f"{phase}/segmentation_hierarchy/epoch_{trainer.current_epoch}_batch_{batch_idx}": wandb.Image(
+                    grid
+                )
+            }
         )
+
+    @torch.no_grad()
+    def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        if trainer.current_epoch % self.val_epoch_freq != 0:
+            return
+        self._log_attn_maps(trainer, pl_module, batch, batch_idx, phase="val")
+
+    @torch.no_grad()
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        if trainer.current_epoch % self.train_epoch_freq != 0:
+            return
+        if batch_idx > 0:
+            return
+        self._log_attn_maps(trainer, pl_module, batch, batch_idx, phase="train")
