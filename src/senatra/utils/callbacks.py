@@ -17,7 +17,7 @@ def up_grid_to_matrix(A_up_grid, q_idx):
     dense = torch.zeros(
         B, 4 * H * W, N_out, device=A_up_grid.device, dtype=A_up_grid.dtype
     )
-    dense.scatter_add_(2, idx.long(), A_flat)  # accumulate 9 neighbours
+    dense.scatter_add_(2, idx.long(), A_flat)
     return dense  # [B, N_in, N_out]
 
 
@@ -29,8 +29,6 @@ class AttnMapLogger(L.Callback):
         self.train_epoch_freq = train_log_every_n_epochs
         self.val_epoch_freq = val_log_every_n_epochs
         self.max_imgs = max_imgs
-
-        # self.freq, self.max_imgs = log_every_n_batches, max_imgs
         self.palette = torch.rand(1, 1024, 3)  # fixed colour set
 
     def _colourise(self, idx_map):
@@ -44,44 +42,67 @@ class AttnMapLogger(L.Callback):
             return
 
         imgs, _ = batch
-        imgs = imgs[: self.max_imgs].to(pl_module.device)  # (B,3,224,224)
+        imgs = imgs[: self.max_imgs].to(pl_module.device)  # (B, 3, 224, 224)
+        B, _, H_in, W_in = imgs.shape  # (B, 3, 224, 224)
 
         _, maps = pl_module.model(imgs, return_attn=True)
-        A1, A2, A3 = maps[0][1], maps[1][1], maps[2][1]  # s1-s3
+        # Assuming maps are (A_ups, A_down) tuples from each stage
+        A1_ups, A2_ups, A3_ups = (
+            maps[0][1],
+            maps[1][1],
+            maps[2][1],
+        )  # A1 - (B, 4, 28, 28, 9), A2 - (B, 4, 14, 14, 9), A3 - (B, 4, 196 49)
 
-        # convert sparse -> dense
-        q1 = pl_module.model.s1.group.q_idx
-        q2 = pl_module.model.s2.group.q_idx
-        M1 = up_grid_to_matrix(A1, q1)  # 3136 -> 784
-        M2 = up_grid_to_matrix(A2, q2)  #  784 -> 196
-        M3 = A3  #  196→49
+        # --- 1. Convert sparse attention grids to dense matrices ---
+        q1_idx = pl_module.model.s1.group.q_idx  # For mapping S1 -> S2
+        q2_idx = pl_module.model.s2.group.q_idx  # For mapping S2 -> S3
+        M1 = up_grid_to_matrix(A1_ups, q1_idx)  # Shape: (B, 3136, 784)
+        M2 = up_grid_to_matrix(A2_ups, q2_idx)  # Shape: (B, 784, 196)
+        M3 = A3_ups  # Shape: (B, 196, 49), already dense
 
-        A2_map = M1
-        A3_map = torch.bmm(M1, M2)
-        A4_map = torch.bmm(A3_map, M3)
+        # --- 2. Compose the matrices to get S1_token -> Final_group mappings ---
+        S1_to_S2_map = M1
+        S1_to_S3_map = torch.bmm(S1_to_S2_map, M2)  # (B, 3136, 196)
+        S1_to_S4_map = torch.bmm(S1_to_S3_map, M3)  # (B, 3136, 49)
 
-        seg2 = A2_map.argmax(-1).view(-1, 56, 56)
-        seg3 = A3_map.argmax(-1).view(-1, 56, 56)
-        seg4 = A4_map.argmax(-1).view(-1, 56, 56)
+        # Get the final group assignment for each S1 token
+        s2_groups_for_s1_tokens = S1_to_S2_map.argmax(-1)  # (B, 3136)
+        s3_groups_for_s1_tokens = S1_to_S3_map.argmax(-1)  # (B, 3136)
+        s4_groups_for_s1_tokens = S1_to_S4_map.argmax(-1)  # (B, 3136)
 
-        H_out = imgs.shape[2]  # 224
+        # --- 3. Create the initial, pixel-to-S1_token mapping ---
+        patch_size = 4
+        px, py = torch.meshgrid(
+            torch.arange(H_in, device=pl_module.device),
+            torch.arange(W_in, device=pl_module.device),
+            indexing="ij",
+        )
+        token_x = px // patch_size
+        token_y = py // patch_size
+        num_tokens_w = W_in // patch_size
+        initial_pixel_to_s1_token_map = (
+            token_x * num_tokens_w + token_y
+        ).flatten()  # (50176,)
+
+        # Expand for batch and long type for gather
+        initial_map_b = initial_pixel_to_s1_token_map.long().expand(B, -1)  # (B, 50176)
+
+        # --- 4. Apply token-level maps to the pixel-level map using gather ---
+        # For each pixel, find its S1 token ID, then find the final group for that S1 token.
+        seg2_map_flat = torch.gather(s2_groups_for_s1_tokens, 1, initial_map_b)
+        seg3_map_flat = torch.gather(s3_groups_for_s1_tokens, 1, initial_map_b)
+        seg4_map_flat = torch.gather(s4_groups_for_s1_tokens, 1, initial_map_b)
+
+        # Reshape to 2D image segmentation maps
+        seg2 = seg2_map_flat.view(B, H_in, W_in)
+        seg3 = seg3_map_flat.view(B, H_in, W_in)
+        seg4 = seg4_map_flat.view(B, H_in, W_in)
 
         viz_stack = []
         for i in range(imgs.size(0)):
             col2 = self._colourise(seg2[i])
             col3 = self._colourise(seg3[i])
             col4 = self._colourise(seg4[i])
-
-            # upsample colour maps to 224×224
-            col2 = F.interpolate(col2.unsqueeze(0), size=H_out, mode="nearest").squeeze(
-                0
-            )
-            col3 = F.interpolate(col3.unsqueeze(0), size=H_out, mode="nearest").squeeze(
-                0
-            )
-            col4 = F.interpolate(col4.unsqueeze(0), size=H_out, mode="nearest").squeeze(
-                0
-            )
 
             viz_stack.append(
                 torch.stack([imgs[i].cpu(), col2.cpu(), col3.cpu(), col4.cpu()])
@@ -91,16 +112,14 @@ class AttnMapLogger(L.Callback):
             torch.cat(viz_stack, 0), nrow=4, normalize=True, scale_each=True
         )
         trainer.logger.experiment.log(
-            {
-                f"{phase}/segmentation_hierarchy/epoch_{trainer.current_epoch}_batch_{batch_idx}": wandb.Image(
-                    grid
-                )
-            }
+            {f"{phase}/segmentation_hierarchy": wandb.Image(grid)}
         )
 
     @torch.no_grad()
     def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
         if trainer.current_epoch % self.val_epoch_freq != 0:
+            return
+        if batch_idx > 2:
             return
         self._log_attn_maps(trainer, pl_module, batch, batch_idx, phase="val")
 

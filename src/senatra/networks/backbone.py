@@ -182,7 +182,8 @@ class SparseGroupingLayer(nn.Module):
         self,
         in_h: int,
         in_w: int,
-        dim: int,
+        dim_in: int,
+        dim_out: int,
         window=3,
         local: bool = True,
         num_iters: int = 3,
@@ -199,15 +200,16 @@ class SparseGroupingLayer(nn.Module):
         self.N_in, self.N_out = in_h * in_w, (in_h // 2) * (
             in_w // 2
         )  # Number of input and output tokens
-        self.dim = dim  # Dimension of the input tokens
+        self.dim_in = dim_in  # Dimension of the input tokens
+        self.dim_out = dim_out  # Dimension of the output tokens
         self.local = local  # Whether to use local self attention
         self.num_iters = num_iters  # Number of iterations in the sparse grouping layer
         self.window = window  # Window size for the local self attention
 
         # Initial convolution layer for downsampling and create the initial slots - line 1 in algorithm 1 in the paper
         self.seed_conv = nn.Conv2d(
-            in_channels=dim,
-            out_channels=dim,
+            in_channels=dim_in,
+            out_channels=dim_out,
             kernel_size=3,
             stride=2,
             padding=1,
@@ -218,17 +220,19 @@ class SparseGroupingLayer(nn.Module):
         )  # Initialize the weights of the convolution layer
 
         # Project X_in and X_out into query = q_proj(X_out), key = k_proj(X_in), and value = v_proj(X_in) vectors.
-        self.q_proj = nn.Linear(in_features=dim, out_features=dim, bias=False)
-        self.k_proj = nn.Linear(in_features=dim, out_features=dim, bias=False)
-        self.v_proj = nn.Linear(in_features=dim, out_features=dim, bias=False)
+        self.q_proj = nn.Linear(in_features=dim_out, out_features=dim_in, bias=False)
+        self.k_proj = nn.Linear(in_features=dim_in, out_features=dim_in, bias=False)
+        self.v_proj = nn.Linear(in_features=dim_in, out_features=dim_out, bias=False)
 
         # MLP layer for updating the slots - line 10 in algorithm 1 in the paper
+        hidden_dim = int(dim_out * 2)
         self.mlp = nn.Sequential(
-            nn.Linear(dim, dim * 2), nn.GELU(), nn.Linear(dim * 2, dim)
+            nn.Linear(dim_out, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, dim_out)
         )
 
-        self.ln_in, self.ln_out = nn.LayerNorm(dim), nn.LayerNorm(dim)
-        self.tau = nn.Parameter(torch.tensor(math.log(dim**-0.5)))
+        self.ln_in, self.ln_out = nn.LayerNorm(dim_in), nn.LayerNorm(dim_out)
+        self.ln_attn, self.ln_mlp = nn.LayerNorm(dim_out), nn.LayerNorm(dim_out)
+        self.tau = nn.Parameter(torch.tensor(math.log(dim_in**-0.5)))
 
         if local:
             self.rpb = _WindowRelPosBias(4)
@@ -237,85 +241,89 @@ class SparseGroupingLayer(nn.Module):
 
     # ----- dense -------------------------------------------------------
     def _dense_forward(self, x):
-        B, N_in, D = x.shape
+        B, N_in, _ = x.shape
         eps = 1e-6
         x_out = self.ln_out(
-            self.seed_conv(x.transpose(1, 2).reshape(B, D, self.Hi, self.Wi))
+            self.seed_conv(x.transpose(1, 2).reshape(B, self.dim_in, self.Hi, self.Wi))
             .flatten(2)
             .transpose(1, 2)
-        )
-        k = self.k_proj(self.ln_in(x))  # Shape: (B, N_in, D)
-        v = self.v_proj(x)  # Shape: (B, N_in, D)
+        )  # (B, Ho*Wo, self.dim_out)
+        k = self.k_proj(self.ln_in(x))  # Shape: (B, N_in, self.dim_in)
+        v = self.v_proj(self.ln_in(x))  # Shape: (B, N_in, self.dim_out)
 
         for _ in range(self.num_iters):
-            q = self.q_proj(self.ln_out(x_out))  # Shape: (B, N_out, D)
-            logits = torch.bmm(k, q.transpose(1, 2)) * torch.exp(self.tau)
+            q = self.q_proj(self.ln_out(x_out))  # Shape: (B, N_out, self.dim_out)
+            logits = torch.bmm(k, q.transpose(1, 2)) * torch.exp(
+                self.tau
+            )  # (B, N_in, N_out)
             a_ups = logits.softmax(dim=-1) + eps
             col_sums = a_ups.sum(dim=1, keepdim=True)  # Shape: (B, 1, N_out)
             a_down = a_ups / col_sums  # Shape: (B, N_in, N_out)
 
             updates = torch.bmm(a_down.transpose(1, 2), v)
-            x_out = x_out + self.ln_out(updates)
 
-            x_out = x_out + self.ln_out(self.mlp(x_out))
+            x_out = x_out + self.ln_attn(updates)
+            x_out = x_out + self.ln_mlp(self.mlp(x_out))
 
         return x_out, a_ups, a_down
 
     # ----- sparse ------------------------------------------------------
     def _sparse_forward(self, x):
-        B, _, D = x.shape
+        B, _, _ = x.shape
         eps = 1e-6
 
         A_row_list, A_col_list = [], []
 
         # ---- K, V patches ------------------------------------------------
         # Project and reshape k
-        k_proj = self.k_proj(self.ln_in(x))  # (B, N, self.dim)
-        k_trans = k_proj.transpose(1, 2)  # (B, self.dim, N)
+        k_proj = self.k_proj(self.ln_in(x))  # (B, N, self.dim_in)
+        k_trans = k_proj.transpose(1, 2)  # (B, self.dim_in, N)
         k_map = k_trans.reshape(
-            B, D, self.Hi, self.Wi
-        )  # (B, self.dim, self.Hi, self.Wi)
+            B, self.dim_in, self.Hi, self.Wi
+        )  # (B, self.dim_in, self.Hi, self.Wi)
         k_unfold = F.unfold(
             input=k_map, kernel_size=2, stride=2
-        )  # (B, self.dim*4, self.Ho*self.Wo) where Ho = Hi/2 and Wo = Wi/2
+        )  # (B, self.dim_in*4, self.Ho*self.Wo) where Ho = Hi/2 and Wo = Wi/2
         k_view = k_unfold.view(
-            B, D, 4, self.Ho, self.Wo
-        )  # (B, self.dim, 4, self.Ho, self.Wo)
+            B, self.dim_in, 4, self.Ho, self.Wo
+        )  # (B, self.dim_in, 4, self.Ho, self.Wo)
         k = k_view.permute(
             0, 2, 3, 4, 1
-        ).contiguous()  # (B, 4, self.Ho, self.Wo, self.dim)
+        ).contiguous()  # (B, 4, self.Ho, self.Wo, self.dim_in)
 
         # Project and reshape v
-        v_proj = self.v_proj(x)  # (B, N, self.dim)
-        v_trans = v_proj.transpose(1, 2)  # (B, self.dim, N)
+        v_proj = self.v_proj(self.ln_in(x))  # (B, N, self.dim_out)
+        v_trans = v_proj.transpose(1, 2)  # (B, self.dim_out, N)
         v_map = v_trans.reshape(
-            B, D, self.Hi, self.Wi
-        )  # (B, self.dim, self.Hi, self.Wi)
+            B, self.dim_out, self.Hi, self.Wi
+        )  # (B, self.dim_out, self.Hi, self.Wi)
         v_unfold = F.unfold(
             input=v_map, kernel_size=2, stride=2
-        )  # (B, self.dim*4, self.Ho*self.Wo) where Ho = Hi/2 and Wo = Wi/2
+        )  # (B, self.dim_out*4, self.Ho*self.Wo) where Ho = Hi/2 and Wo = Wi/2
         v_view = v_unfold.view(
-            B, D, 4, self.Ho, self.Wo
-        )  # (B, self.dim, 4, self.Ho, self.Wo)
+            B, self.dim_out, 4, self.Ho, self.Wo
+        )  # (B, self.dim_out, 4, self.Ho, self.Wo)
         v = v_view.permute(
             0, 2, 3, 4, 1
-        ).contiguous()  # (B, 4, self.Ho, self.Wo, self.dim)
+        ).contiguous()  # (B, 4, self.Ho, self.Wo, self.dim_out)
 
         # ---- seed slots ---------------------------------------------------
         x_reshaped = x.transpose(1, 2).reshape(
-            B, D, self.Hi, self.Wi
-        )  # (B, D, self.Hi, self.Wi)
-        x_conv = self.seed_conv(x_reshaped)  # (B, D, self.Ho, self.Wo)
-        x_flat = x_conv.flatten(2)  # (B, D, self.Ho*self.Wo)
-        x_trans = x_flat.transpose(1, 2)  # (B, self.Ho*self.Wo, D)
-        x_out = self.ln_out(x_trans)  # (B, self.Ho*self.Wo, D)
+            B, self.dim_in, self.Hi, self.Wi
+        )  # (B, self.dim_in, self.Hi, self.Wi)
+        x_conv = self.seed_conv(x_reshaped)  # (B, self.dim_out, self.Ho, self.Wo)
+        x_flat = x_conv.flatten(2)  # (B, self.dim_out, self.Ho*self.Wo)
+        x_trans = x_flat.transpose(1, 2)  # (B, self.Ho*self.Wo, self.dim_out)
+        x_out = self.ln_out(x_trans)  # (B, self.Ho*self.Wo, self.dim_out)
 
         for _ in range(self.num_iters):
             q = self.q_proj(self.ln_out(x_out))  # (B, self.Ho*self.Wo, D)
-            q = q.view(B, self.Ho, self.Wo, D)  # (B, self.Ho, self.Wo, D)
-            q = q.unsqueeze(1)  # (B, 1, self.Ho, self.Wo, D)
-            q = q.repeat(1, 4, 1, 1, 1)  # (B, 4, self.Ho, self.Wo, D)
-            q = q.contiguous()  # (B, 4, self.Ho, self.Wo, D)
+            q = q.view(
+                B, self.Ho, self.Wo, self.dim_in
+            )  # (B, self.Ho, self.Wo, self.dim_in)
+            q = q.unsqueeze(1)  # (B, 1, self.Ho, self.Wo, self.dim_in)
+            q = q.repeat(1, 4, 1, 1, 1)  # (B, 4, self.Ho, self.Wo, self.dim_in)
+            q = q.contiguous()  # (B, 4, self.Ho, self.Wo, self.dim_in)
 
             # ---- attention -----------------------------------------------
             attn = natten_F.na2d_qk(
@@ -332,21 +340,17 @@ class SparseGroupingLayer(nn.Module):
                 self.q_idx.expand(B, 4, -1, -1, -1).flatten(2, 3).long()
             )  # (B, 1, Ho*Wo, 9)
 
-            num_input_tokens = 4 * self.Ho * self.Wo
-
-            # We create a tensor to hold the sum of each column (input token)
+            # We create a tensor to hold the sum of each column
             col_sums_sparse = torch.zeros(
-                B, num_input_tokens, dtype=torch.float32, device=q.device
-            )
+                B, self.N_out, dtype=torch.float32, device=q.device
+            )  # (B, Ho*Wo)
 
             # Flatten the attention scores and indices for efficient processing
             attn_flat_1d = attn_flat.flatten(1, -1)  # (B, 4*784*9) = (256, 28224)
             q_idx_flat_1d = q_idx_flat.flatten(1, -1)  # (B, 4*784*9) = (256, 28224)
 
             # Create batch offsets to make indices unique across batches
-            batch_offsets = (
-                torch.arange(B, device=q.device).unsqueeze(1) * num_input_tokens
-            )
+            batch_offsets = torch.arange(B, device=q.device).unsqueeze(1) * self.N_out
             q_idx_with_batch = q_idx_flat_1d + batch_offsets
 
             # Flatten everything for a single scatter_add_ operation
@@ -361,12 +365,12 @@ class SparseGroupingLayer(nn.Module):
                 dim=0, index=q_idx_flat_all.to(torch.int64), src=attn_flat_all
             )
 
-            # Reshape back to (B, num_input_tokens)
-            col_sums_sparse = col_sums_flat.view(B, num_input_tokens)
+            # Reshape back to (B, N_out)
+            col_sums_sparse = col_sums_flat.view(B, self.N_out)  # (B, Ho*Wo)
 
             # 2. Gather the corresponding column sum for each attention score
             # We need to reshape col_sums_sparse to match the dimensions of q_idx_flat
-            # col_sums_sparse: (B, num_input_tokens) -> (B, 1, num_input_tokens) -> (B, 4, Ho*Wo, num_input_tokens)
+            # col_sums_sparse: (B, Ho*Wo) -> (B, 1, Ho*Wo) -> (B, 4, Ho*Wo, Ho*Wo)
             col_sums_expanded = (
                 col_sums_sparse.unsqueeze(1)
                 .unsqueeze(2)
@@ -384,9 +388,11 @@ class SparseGroupingLayer(nn.Module):
             A_col = A_col.view(B, 4, self.Ho, self.Wo, 9)
 
             updates = natten_F.na2d_av(A_col, v, 3)
-            updates = updates.sum(dim=1).permute(0, 3, 1, 2).flatten(2).transpose(1, 2)
-            x_out = x_out + updates
-            x_out = x_out + self.ln_out(self.mlp(x_out))
+            updates = (
+                updates.sum(dim=1).permute(0, 3, 1, 2).flatten(2).transpose(1, 2)
+            )  # (B, Ho*Wo, self.dim_out)
+            x_out = x_out + self.ln_attn(updates)
+            x_out = x_out + self.ln_mlp(self.mlp(x_out))
 
             A_row_list.append(attn)
             A_col_list.append(A_col)
@@ -431,15 +437,16 @@ class SeNaTraStage(nn.Module):
             self.group = SparseGroupingLayer(
                 in_h=in_h,
                 in_w=in_w,
-                dim=dim_in,
+                dim_in=dim_in,
+                dim_out=dim_out,
                 window=3 if not dense_group else None,
                 local=not dense_group,
                 num_iters=3,
             )
-            self.proj = nn.Linear(
-                dim_in, dim_out
-            )  # Should we do the projection here or inside the sparse grouping layer?
-            self.norm = nn.LayerNorm(dim_out)
+            # self.proj = nn.Linear(
+            #     dim_in, dim_out
+            # )  # Should we do the projection here or inside the sparse grouping layer?
+            # self.norm = nn.LayerNorm(dim_out)
             post_h, post_w = in_h // 2, in_w // 2
             post_dim = dim_out
         else:
@@ -453,13 +460,10 @@ class SeNaTraStage(nn.Module):
 
     def forward(self, x):
         # x: (B, 3136, 64 (T), 128 (B), 192 (L))
+        A_up, A_down = None, None
+
         if self.use_group:
             x, A_up, A_down = self.group(x)
-            x = self.proj(x)
-            x = self.norm(x)
-        else:
-            A_up = None
-            A_down = None
 
         for blk in self.blocks:
             x = blk(x)
