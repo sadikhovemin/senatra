@@ -9,13 +9,13 @@ model:
 
 data:
   data_dir: /storage/group/dataset_mirrors/imagenet2012/imagenet2012_download
-  batch_size: 256
-  num_workers: 2
+  batch_size: 128
+  num_workers: 8
   img_size: 224
 
 trainer:
   accelerator: gpu
-  devices: 4
+  devices: 2
   max_epochs: 300
   precision: "bf16-mixed"
   log_every_n_steps: 100
@@ -36,8 +36,8 @@ trainer:
       
     - class_path: src.senatra.utils.callbacks.AttnMapLogger
       init_args:
-        train_log_every_n_epochs: 2
-        val_log_every_n_epochs: 5
+        train_log_every_n_epochs: 5
+        val_log_every_n_epochs: 10
         max_imgs: 4
 
   logger:

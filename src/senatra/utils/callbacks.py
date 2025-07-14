@@ -6,21 +6,6 @@ import wandb
 from torchvision.utils import make_grid
 
 
-def up_grid_to_matrix(A_up_grid, q_idx):
-    # Convert sparse [B, 4, H, W, 9] attention to dense [B, N_in, N_out]
-    B, _, H, W, _ = A_up_grid.shape
-    A_flat = A_up_grid.reshape(B, 4 * H * W, 9)  # [B, N_in, 9]
-    idx = q_idx.expand(B, 4, -1, -1, -1)  # [B,4,H,W,9]
-    idx = idx.reshape(B, 4 * H * W, 9)  # [B, N_in, 9]
-
-    N_out = H * W
-    dense = torch.zeros(
-        B, 4 * H * W, N_out, device=A_up_grid.device, dtype=A_up_grid.dtype
-    )
-    dense.scatter_add_(2, idx.long(), A_flat)
-    return dense  # [B, N_in, N_out]
-
-
 class AttnMapLogger(L.Callback):
     def __init__(
         self, train_log_every_n_epochs=5, val_log_every_n_epochs=10, max_imgs=4
@@ -54,11 +39,9 @@ class AttnMapLogger(L.Callback):
         )  # A1 - (B, 4, 28, 28, 9), A2 - (B, 4, 14, 14, 9), A3 - (B, 4, 196 49)
 
         # --- 1. Convert sparse attention grids to dense matrices ---
-        q1_idx = pl_module.model.s1.group.q_idx  # For mapping S1 -> S2
-        q2_idx = pl_module.model.s2.group.q_idx  # For mapping S2 -> S3
-        M1 = up_grid_to_matrix(A1_ups, q1_idx)  # Shape: (B, 3136, 784)
-        M2 = up_grid_to_matrix(A2_ups, q2_idx)  # Shape: (B, 784, 196)
-        M3 = A3_ups  # Shape: (B, 196, 49), already dense
+        M1 = A1_ups
+        M2 = A2_ups
+        M3 = A3_ups
 
         # --- 2. Compose the matrices to get S1_token -> Final_group mappings ---
         S1_to_S2_map = M1

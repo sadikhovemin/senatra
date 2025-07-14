@@ -16,6 +16,82 @@ def _get_rope(freq_cache, seq_len, dim, device, batch_size):
     return freq_cache[key]
 
 
+def build_M_loc(Hi: int, Wi: int, window: int = 3, dtype=torch.float32):
+    """
+    Builds a local attention mask of shape (N_in, N_out), where each (i, j) entry is:
+    - 0 if output slot j is within the 3x3 window centered around input token i,
+    - -1e4 otherwise.
+    """
+    Ho, Wo = Hi // 2, Wi // 2
+    N_in = Hi * Wi
+    N_out = Ho * Wo
+    large_neg = -1e4
+
+    # initialise everything to "forbidden"
+    mask = torch.full((N_in, N_out), large_neg, dtype=dtype)  # (N_in, N_out)
+
+    # 1. (row, col) coordinate of every input token
+    in_rows, in_cols = torch.meshgrid(
+        torch.arange(Hi), torch.arange(Wi), indexing="ij"
+    )  # each (Hi, Wi)
+    in_rows = in_rows.flatten()  # (Nin,)
+    in_cols = in_cols.flatten()
+
+    # 2. central output slot each input maps to (integer down-sampling by 2)
+    out_r0 = (in_rows // 2).clamp(0, Ho - 1)
+    out_c0 = (in_cols // 2).clamp(0, Wo - 1)
+
+    # 3. for every shift inside the 3×3 window, mark the position "allowed"
+    half_w = window // 2  # 1 for a 3×3 window
+    in_idx = torch.arange(N_in)  # vectorised over all inputs
+
+    for dr in range(-half_w, half_w + 1):
+        for dc in range(-half_w, half_w + 1):
+            out_r = (out_r0 + dr).clamp(0, Ho - 1)
+            out_c = (out_c0 + dc).clamp(0, Wo - 1)
+            out_idx = out_r * Wo + out_c  # flatten to 1-D index
+            mask[in_idx, out_idx] = 0.0  # allow this connection
+
+    return mask
+
+
+def build_qidx_dense(Hi: int, Wi: int, window: int = 3):
+    """
+    Returns a dense index matrix of shape (N_in, N_out), where each (i, j) entry
+    indicates the 3x3 relative position of input token i to output slot j:
+    - Values in {0-8} map to 3x3 window positions (e.g., 0 = top-left, 4 = center),
+    - -1 indicates (i, j) is outside the local window.
+    """
+    Ho, Wo = Hi // 2, Wi // 2
+    N_in, N_out = Hi * Wi, Ho * Wo
+    idx = torch.full((N_in, N_out), -1, dtype=torch.long)  # (N_in, N_out)
+
+    in_r, in_c = torch.meshgrid(
+        torch.arange(Hi),
+        torch.arange(Wi),
+        indexing="ij",
+    )  # each (Hi, Wi)
+    in_r, in_c = in_r.flatten(), in_c.flatten()  # each (N_in,)
+    out_r0, out_c0 = in_r // 2, in_c // 2  # each (N_in,)
+
+    off2i = {
+        (dr, dc): k
+        for k, (dr, dc) in enumerate(
+            [(dr, dc) for dr in (-1, 0, 1) for dc in (-1, 0, 1)]
+        )
+    }
+    in_idx = torch.arange(N_in)
+
+    for dr in (-1, 0, 1):
+        for dc in (-1, 0, 1):
+            out_r = (out_r0 + dr).clamp(0, Ho - 1)
+            out_c = (out_c0 + dc).clamp(0, Wo - 1)
+            out_idx = out_r * Wo + out_c
+            idx[in_idx, out_idx] = off2i[(dr, dc)]
+
+    return idx  # (N_in , N_out)
+
+
 # -----------------------------------------------------------------------------
 # Stochastic Drop
 # -----------------------------------------------------------------------------
@@ -156,27 +232,6 @@ class SeNaTraBlock(nn.Module):
 # -----------------------------------------------------------------------------
 # Grouping Layer
 # -----------------------------------------------------------------------------
-class _WindowRelPosBias(nn.Module):
-    def __init__(self, heads: int):
-        super().__init__()
-        self.bias = nn.Parameter(torch.zeros(heads, 9))
-        nn.init.trunc_normal_(self.bias, std=0.02)
-
-    def forward(self):
-        return self.bias.view(1, -1, 1, 1, 9)
-
-
-def compute_q_idx(Hi, Wi, kernel_size=3, B=1, G=1):
-
-    with torch.no_grad():
-        dummy_q = torch.arange(Hi * Wi, dtype=torch.float32).reshape(1, 1, Hi, Wi, 1)
-        dummy_k = torch.ones_like(dummy_q)
-
-        q_idx = natten_F.na2d_qk(query=dummy_k, key=dummy_q, kernel_size=kernel_size)
-
-    return q_idx
-
-
 class SparseGroupingLayer(nn.Module):
     def __init__(
         self,
@@ -235,9 +290,15 @@ class SparseGroupingLayer(nn.Module):
         self.tau = nn.Parameter(torch.tensor(math.log(dim_in**-0.5)))
 
         if local:
-            self.rpb = _WindowRelPosBias(4)
-            q_idx = compute_q_idx(self.Ho, self.Wo, kernel_size=self.window)
-            self.register_buffer("q_idx", q_idx, persistent=False)
+            self.register_buffer(
+                "M_loc", build_M_loc(in_h, in_w, window=3), persistent=False
+            )
+            self.rpb = nn.Parameter(torch.zeros(9))
+            nn.init.trunc_normal_(self.rpb, std=0.02)
+
+            self.register_buffer(
+                "qidx_dense", build_qidx_dense(in_h, in_w, window=3), persistent=False
+            )
 
     # ----- dense -------------------------------------------------------
     def _dense_forward(self, x):
@@ -267,137 +328,42 @@ class SparseGroupingLayer(nn.Module):
 
         return x_out, a_ups, a_down
 
-    # ----- sparse ------------------------------------------------------
+    # # ----- sparse ------------------------------------------------------
     def _sparse_forward(self, x):
-        B, _, _ = x.shape
-        eps = 1e-6
+        B, N_in, _ = x.shape
 
-        A_row_list, A_col_list = [], []
+        # 1. Seed slots ------------------------------------------------------
+        x_out = self.ln_out(
+            self.seed_conv(x.transpose(1, 2).reshape(B, self.dim_in, self.Hi, self.Wi))
+            .flatten(2)
+            .transpose(1, 2)
+        )
 
-        # ---- K, V patches ------------------------------------------------
-        # Project and reshape k
-        k_proj = self.k_proj(self.ln_in(x))  # (B, N, self.dim_in)
-        k_trans = k_proj.transpose(1, 2)  # (B, self.dim_in, N)
-        k_map = k_trans.reshape(
-            B, self.dim_in, self.Hi, self.Wi
-        )  # (B, self.dim_in, self.Hi, self.Wi)
-        k_unfold = F.unfold(
-            input=k_map, kernel_size=2, stride=2
-        )  # (B, self.dim_in*4, self.Ho*self.Wo) where Ho = Hi/2 and Wo = Wi/2
-        k_view = k_unfold.view(
-            B, self.dim_in, 4, self.Ho, self.Wo
-        )  # (B, self.dim_in, 4, self.Ho, self.Wo)
-        k = k_view.permute(
-            0, 2, 3, 4, 1
-        ).contiguous()  # (B, 4, self.Ho, self.Wo, self.dim_in)
-
-        # Project and reshape v
-        v_proj = self.v_proj(self.ln_in(x))  # (B, N, self.dim_out)
-        v_trans = v_proj.transpose(1, 2)  # (B, self.dim_out, N)
-        v_map = v_trans.reshape(
-            B, self.dim_out, self.Hi, self.Wi
-        )  # (B, self.dim_out, self.Hi, self.Wi)
-        v_unfold = F.unfold(
-            input=v_map, kernel_size=2, stride=2
-        )  # (B, self.dim_out*4, self.Ho*self.Wo) where Ho = Hi/2 and Wo = Wi/2
-        v_view = v_unfold.view(
-            B, self.dim_out, 4, self.Ho, self.Wo
-        )  # (B, self.dim_out, 4, self.Ho, self.Wo)
-        v = v_view.permute(
-            0, 2, 3, 4, 1
-        ).contiguous()  # (B, 4, self.Ho, self.Wo, self.dim_out)
-
-        # ---- seed slots ---------------------------------------------------
-        x_reshaped = x.transpose(1, 2).reshape(
-            B, self.dim_in, self.Hi, self.Wi
-        )  # (B, self.dim_in, self.Hi, self.Wi)
-        x_conv = self.seed_conv(x_reshaped)  # (B, self.dim_out, self.Ho, self.Wo)
-        x_flat = x_conv.flatten(2)  # (B, self.dim_out, self.Ho*self.Wo)
-        x_trans = x_flat.transpose(1, 2)  # (B, self.Ho*self.Wo, self.dim_out)
-        x_out = self.ln_out(x_trans)  # (B, self.Ho*self.Wo, self.dim_out)
+        k = self.k_proj(self.ln_in(x))  # (B, Nin, d)
+        v = self.v_proj(self.ln_in(x))  # (B, Nin, Dout)
 
         for _ in range(self.num_iters):
-            q = self.q_proj(self.ln_out(x_out))  # (B, self.Ho*self.Wo, D)
-            q = q.view(
-                B, self.Ho, self.Wo, self.dim_in
-            )  # (B, self.Ho, self.Wo, self.dim_in)
-            q = q.unsqueeze(1)  # (B, 1, self.Ho, self.Wo, self.dim_in)
-            q = q.repeat(1, 4, 1, 1, 1)  # (B, 4, self.Ho, self.Wo, self.dim_in)
-            q = q.contiguous()  # (B, 4, self.Ho, self.Wo, self.dim_in)
+            q = self.q_proj(self.ln_out(x_out))  # (B, Nout, d)
 
-            # ---- attention -----------------------------------------------
-            attn = natten_F.na2d_qk(
-                query=k, key=q, kernel_size=3
-            )  # (B, 4, self.Ho, self.Wo, 9) - the last dimension is the size of the local region that query attends to in the key
-            attn = attn + self.rpb()  # (B, 4, self.Ho, self.Wo, 9)
-            attn = (
-                F.softmax(attn * torch.exp(self.tau), dim=-1) + eps
-            )  # (B, 4, self.Ho, self.Wo, 9) - Each token in X_in (self.Hi*self.Wi) attends to 9 tokens in X_out (self.Ho*self.Wo) where Ho = Hi/2 and Wo = Wi/2
+            # 3. logits with learnable τ and rel-pos bias
+            logits = (k @ q.transpose(1, 2)) * torch.exp(self.tau)  # τ·kqᵀ
+            bias = self.rpb[self.qidx_dense]  # (Nin, Nout)
+            logits = logits + bias.unsqueeze(0)  # (B, Nin, Nout)
+            logits = logits + self.M_loc  # + M_loc (0 / −1e4)
 
-            # Flatten attn over spatial dimensions (Ho*Wo)
-            attn_flat = attn.flatten(2, 3)  # (B, 4, Ho*Wo, 9)
-            q_idx_flat = (
-                self.q_idx.expand(B, 4, -1, -1, -1).flatten(2, 3).long()
-            )  # (B, 1, Ho*Wo, 9)
+            # 5. row soft-max
+            a_ups = logits.softmax(dim=-1)
 
-            # We create a tensor to hold the sum of each column
-            col_sums_sparse = torch.zeros(
-                B, self.N_out, dtype=torch.float32, device=q.device
-            )  # (B, Ho*Wo)
+            # 6. column renormalisation
+            col_sums = a_ups.sum(dim=1, keepdim=True)  # (B,1,Nout)
+            a_down = a_ups / (col_sums + 1e-8)  # columns sum to 1
 
-            # Flatten the attention scores and indices for efficient processing
-            attn_flat_1d = attn_flat.flatten(1, -1)  # (B, 4*784*9) = (256, 28224)
-            q_idx_flat_1d = q_idx_flat.flatten(1, -1)  # (B, 4*784*9) = (256, 28224)
-
-            # Create batch offsets to make indices unique across batches
-            batch_offsets = torch.arange(B, device=q.device).unsqueeze(1) * self.N_out
-            q_idx_with_batch = q_idx_flat_1d + batch_offsets
-
-            # Flatten everything for a single scatter_add_ operation
-            # This sums all attention scores that belong to the same input token (column)
-            col_sums_flat = col_sums_sparse.flatten()  # (B * 3136) = (1024)
-            q_idx_flat_all = q_idx_with_batch.flatten()  # (B * 576) = (9216)
-            attn_flat_all = attn_flat_1d.flatten()  # (B * 576) = (9216)
-
-            # Single scatter_add_ operation for all batches
-            # This sums all attention scores that belong to the same input token (column)
-            col_sums_flat.scatter_add_(
-                dim=0, index=q_idx_flat_all.to(torch.int64), src=attn_flat_all
-            )
-
-            # Reshape back to (B, N_out)
-            col_sums_sparse = col_sums_flat.view(B, self.N_out)  # (B, Ho*Wo)
-
-            # 2. Gather the corresponding column sum for each attention score
-            # We need to reshape col_sums_sparse to match the dimensions of q_idx_flat
-            # col_sums_sparse: (B, Ho*Wo) -> (B, 1, Ho*Wo) -> (B, 4, Ho*Wo, Ho*Wo)
-            col_sums_expanded = (
-                col_sums_sparse.unsqueeze(1)
-                .unsqueeze(2)
-                .expand(B, 4, self.Ho * self.Wo, -1)
-            )
-
-            # Gather the appropriate column sum for each attention score
-            # q_idx_flat: (B, 1, Ho*Wo, 9) contains indices into the num_input_tokens
-            col_sums_for_each_attn = torch.gather(
-                col_sums_expanded, dim=3, index=q_idx_flat.to(torch.int64)
-            )
-
-            # 3. Perform column normalization
-            A_col = attn_flat / (col_sums_for_each_attn + 1e-8)  # (B, 4, 784, 9)
-            A_col = A_col.view(B, 4, self.Ho, self.Wo, 9)
-
-            updates = natten_F.na2d_av(A_col, v, 3)
-            updates = (
-                updates.sum(dim=1).permute(0, 3, 1, 2).flatten(2).transpose(1, 2)
-            )  # (B, Ho*Wo, self.dim_out)
+            # 9. slot update
+            updates = torch.bmm(a_down.transpose(1, 2), v)  # (B,Nout,Dout)
             x_out = x_out + self.ln_attn(updates)
             x_out = x_out + self.ln_mlp(self.mlp(x_out))
 
-            A_row_list.append(attn)
-            A_col_list.append(A_col)
-
-        return x_out, A_row_list[-1], A_col_list[-1]
+        return x_out, a_ups, a_down
 
     def forward(self, x: torch.Tensor):
         # x: (B, N, D)
